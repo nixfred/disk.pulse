@@ -1,10 +1,13 @@
 """Telemetry regressions: fixtures and temporary directories only, never the live machine."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import runpy
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -398,6 +401,211 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(json.loads(path.read_text()), {'ts': 1, 'free': None})
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual([p.name for p in Path(tmp).iterdir()], ['snapshot.json'])
+
+
+class CodexHuntRegressions(unittest.TestCase):
+    """One test per recorder finding of the 2026-09-10 Codex review.
+
+    Each reproduced the defect before its fix and pins the behaviour now.
+    """
+
+    def test_1_a_falling_inflight_gauge_is_not_a_counter_reset(self):
+        # Field 9 is requests in flight. It fell from 4 to 0 while 12,000
+        # sectors were read; the sample used to be thrown away as a reset.
+        a = '100 5 8000 50 20 2 4000 40 4 300 400 0 0 0 0 0 0'
+        b = '160 5 20000 80 30 2 8000 60 0 1200 1000 0 0 0 0 0 0'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_block(root, 'sda', a)
+            with patch.object(disk, 'SYS_BLOCK', root):
+                first = disk.disks(None, 1000.0)
+                (root / 'sda/stat').write_text(b)
+                second = disk.disks({d['name']: d for d in first}, 1003.0)
+        self.assertAlmostEqual(second[0]['rates']['read'], 12000 * 512 / 3)
+        self.assertAlmostEqual(second[0]['rates']['util'], 30)
+
+    def test_3_remote_probes_share_one_deadline(self):
+        gate = threading.Event()
+        real = os.statvfs
+        def statvfs(mount):
+            gate.wait(5)
+            return real('/')
+        probe = disk.RemoteProbe()
+        mounts = ['/a', '/b', '/c', '/d']
+        try:
+            with patch.object(disk.os, 'statvfs', side_effect=statvfs), patch.object(disk, 'REMOTE_DEADLINE', 0.2):
+                started = time.monotonic()
+                for m in mounts:
+                    probe.start(m)
+                probe.wait(mounts)
+                rows = [disk.usage({'mount': m, 'remote': True}, probe, wait=False) for m in mounts]
+                elapsed = time.monotonic() - started
+        finally:
+            gate.set()
+        # Four hung shares, one deadline: well under four deadlines.
+        self.assertLess(elapsed, 0.2 * 2.5)
+        self.assertTrue(all(r['responsive'] is False for r in rows))
+        self.assertTrue(all(r['freePct'] is None for r in rows))
+
+    def test_3b_a_slow_share_with_a_recent_reading_stays_responsive(self):
+        # A cloud mount that takes two seconds to answer is slow, not gone:
+        # it keeps its standing until the grace period runs out.
+        gate = threading.Event()
+        real = os.statvfs
+        calls = {'n': 0}
+        def statvfs(mount):
+            calls['n'] += 1
+            if calls['n'] > 1:
+                gate.wait(5)
+            return real('/')
+        probe = disk.RemoteProbe()
+        try:
+            with patch.object(disk.os, 'statvfs', side_effect=statvfs), patch.object(disk, 'REMOTE_DEADLINE', 0.05):
+                first = disk.usage({'mount': '/cloud', 'remote': True}, probe)
+                self.assertTrue(first['responsive'])
+                slow = disk.usage({'mount': '/cloud', 'remote': True}, probe)
+                self.assertTrue(slow['responsive'])
+                self.assertEqual(slow['total'], first['total'])
+                with patch.object(disk, 'REMOTE_GRACE', 0.0):
+                    gone = disk.usage({'mount': '/cloud', 'remote': True}, probe)
+                self.assertFalse(gone['responsive'])
+                self.assertEqual(gone['total'], first['total'])
+        finally:
+            gate.set()
+
+    def test_4_a_failed_probe_is_unavailable_and_keeps_the_last_good_reading(self):
+        real = os.statvfs
+        calls = {'n': 0}
+        def statvfs(mount):
+            calls['n'] += 1
+            if calls['n'] > 1:
+                raise OSError('transport endpoint is not connected')
+            return real('/')
+        probe = disk.RemoteProbe()
+        with patch.object(disk.os, 'statvfs', side_effect=statvfs):
+            good = disk.usage({'mount': '/nas', 'remote': True}, probe)
+            self.assertTrue(good['responsive'])
+            self.assertGreater(good['total'], 0)
+            bad = disk.usage({'mount': '/nas', 'remote': True}, probe)
+        self.assertFalse(bad['responsive'])
+        self.assertEqual(bad['total'], good['total'])
+        self.assertEqual(bad['freePct'], good['freePct'])
+        # A mount that never answered has no capacity at all, and it is null.
+        with patch.object(disk.os, 'statvfs', side_effect=OSError('no route')):
+            never = disk.usage({'mount': '/dead', 'remote': True}, probe)
+        self.assertFalse(never['responsive'])
+        self.assertIsNone(never['freePct'])
+
+    def test_5_a_thread_that_fails_to_start_does_not_poison_the_mount(self):
+        probe = disk.RemoteProbe()
+        with patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")):
+            value, responsive = probe('/share')
+        self.assertIsNone(value)
+        self.assertFalse(responsive)
+        self.assertEqual(probe.pending, {})
+        with patch.object(disk.os, 'statvfs', return_value=os.statvfs('/')):
+            value, responsive = probe('/share')
+        self.assertIsNotNone(value)
+        self.assertTrue(responsive)
+
+    def test_7_unread_smart_is_unread_not_healthy_and_sentinels_are_null(self):
+        nvme_drive = '/org/freedesktop/UDisks2/drives/N'
+        ata_drive = '/org/freedesktop/UDisks2/drives/A'
+        objects = {
+            nvme_drive: {'org.freedesktop.UDisks2.Drive': {},
+                         'org.freedesktop.UDisks2.NVMe.Controller': {'SmartUpdated': 0, 'SmartCriticalWarning': [], 'SmartTemperature': 0}},
+            ata_drive: {'org.freedesktop.UDisks2.Drive': {},
+                        'org.freedesktop.UDisks2.Drive.Ata': {'SmartSupported': True, 'SmartUpdated': 5, 'SmartNumBadSectors': -1,
+                                                              'SmartNumAttributesFailing': -1, 'SmartPowerOnSeconds': 0, 'SmartFailing': False}},
+            '/org/freedesktop/UDisks2/block_devices/nvme0n1': {'org.freedesktop.UDisks2.Block': {'Drive': nvme_drive, 'Device': list(b'/dev/nvme0n1\0')}},
+            '/org/freedesktop/UDisks2/block_devices/sda': {'org.freedesktop.UDisks2.Block': {'Drive': ata_drive, 'Device': list(b'/dev/sda\0')}},
+        }
+        out = disk.smart(lambda args: [objects] if 'GetManagedObjects' in args else None)
+        self.assertEqual(out['nvme0n1']['kind'], 'none')
+        self.assertEqual(out['nvme0n1']['reason'], 'SMART not read yet')
+        self.assertEqual(out['sda']['kind'], 'ata')
+        self.assertIsNone(out['sda']['badSectors'])
+        self.assertIsNone(out['sda']['attributesFailing'])
+        self.assertIsNone(out['sda']['powerOnHours'])
+
+    def test_9_10_mixed_pool_and_a_converted_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / 'btrfs/aaaa'
+            # mixed still lists the empty single it was converted away from;
+            # raid1 holds the bytes now. system is plain dup.
+            for kind, dirs, used, total, disk_total in (('mixed', {'single': 0, 'raid1': 200}, 100, 200, 400),
+                                                        ('system', {'dup': 2}, 1, 2, 4)):
+                (pool / 'allocation' / kind).mkdir(parents=True)
+                for profile, bytes_ in dirs.items():
+                    (pool / 'allocation' / kind / profile).mkdir()
+                    (pool / 'allocation' / kind / profile / 'total_bytes').write_text(str(bytes_))
+                (pool / 'allocation' / kind / 'bytes_used').write_text(str(used))
+                (pool / 'allocation' / kind / 'total_bytes').write_text(str(total))
+                (pool / 'allocation' / kind / 'disk_total').write_text(str(disk_total))
+                (pool / 'allocation' / kind / 'disk_used').write_text(str(used))
+            (pool / 'devices/dm-0').mkdir(parents=True)
+            (root / 'block/dm-0').mkdir(parents=True)
+            (root / 'block/dm-0/size').write_text('1')
+            with patch.object(disk, 'SYS_BTRFS', root / 'btrfs'), patch.object(disk, 'SYS_BLOCK', root / 'block'):
+                p = disk.btrfs_pools()['aaaa']
+        self.assertIn('mixed', p['spaces'])
+        self.assertEqual(p['spaces']['mixed']['profile'], 'raid1')
+        self.assertEqual(p['spaces']['system']['profile'], 'dup')
+        self.assertEqual(p['unallocated'], 512 - 404)
+
+    def test_12_a_one_shot_snapshot_touches_no_state(self):
+        with patch.object(disk, 'snapshot', return_value={'ok': True}), \
+             patch.object(disk, 'prepare_state', side_effect=AssertionError('state was touched')), \
+             patch.object(sys, 'argv', ['disk_pulse.py', 'snapshot']), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            disk.main()
+        self.assertEqual(json.loads(out.getvalue()), {'ok': True})
+
+    def test_13_a_one_shot_snapshot_ranks_processes_by_rate(self):
+        calls = []
+        def fake_hogs(previous=None, now=None, scan=None):
+            calls.append(previous)
+            return [], {'k': 1}
+        with patch.object(disk, 'smart', return_value={}), patch.object(disk, 'trim_status', return_value={}), \
+             patch.object(disk, 'metrics', return_value={'disks': [], 'ts': 1}), \
+             patch.object(disk, 'hogs', side_effect=fake_hogs), patch.object(disk.time, 'sleep'):
+            disk.snapshot()
+        self.assertEqual(calls, [None, {'k': 1}])
+
+    def test_14_no_eligible_filesystem_keeps_the_rest_of_telemetry(self):
+        with patch.object(disk, 'mounts', return_value=[]), patch.object(disk, 'disks', return_value=[]), \
+             patch.object(disk, 'btrfs_pools', return_value={}):
+            m = disk.metrics(None)
+        self.assertEqual(m['filesystems'], [])
+        self.assertIsNone(disk.primary_of(m))
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(disk, 'STATE', Path(tmp)), patch.object(disk, 'read', return_value=''):
+                db = disk.db_open()
+                try:
+                    disk.record(db, dict(m, ts=5.0))
+                    self.assertIsNone(db.execute('SELECT used FROM samples').fetchone()[0])
+                finally:
+                    db.close()
+
+    def test_15_real_mounts_that_share_a_hidden_prefix_are_kept(self):
+        raw = '\n'.join([
+            '1 0 8:1 / /development rw - ext4 /dev/sdb1 rw',
+            '2 0 0:5 / /dev/shm rw - tmpfs tmpfs rw',
+            '3 0 8:2 / /dev/disk-images rw - ext4 /dev/sdb2 rw',
+            '4 0 8:3 / /proc-data rw - xfs /dev/sdb3 rw',
+            '5 0 8:4 / /sys rw - ext4 /dev/sdb4 rw',
+        ])
+        self.assertEqual([r['mount'] for r in disk.mounts(raw)], ['/development', '/proc-data'])
+
+    def test_16_the_shorter_mount_brings_its_own_flags(self):
+        raw = '1 0 8:1 / /long-bind ro,noatime - ext4 /dev/sdb1 rw\n2 0 8:1 / /rw rw - ext4 /dev/sdb1 rw\n'
+        rows = disk.mounts(raw)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['mount'], '/rw')
+        self.assertFalse(rows[0]['readonly'])
+        self.assertEqual(rows[0]['also'], ['/long-bind'])
+        self.assertNotIn('noatime', rows[0]['flags'])
 
 
 if __name__ == '__main__':

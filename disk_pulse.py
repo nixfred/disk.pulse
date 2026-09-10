@@ -36,6 +36,10 @@ PSEUDO_FS = {'proc', 'sysfs', 'tmpfs', 'devtmpfs', 'devpts', 'cgroup', 'cgroup2'
 NETWORK_FS = {'nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', '9p', 'afs', 'ceph', 'glusterfs', 'sshfs',
               'davfs', 'fuse.sshfs', 'fuse.rclone', 'fuse.davfs2', 'fuse.gcsfuse', 'fuse.s3fs'}
 REMOTE_DEADLINE = 1.5
+# A share that answered recently but is taking longer than the deadline this
+# time is slow, not gone. It keeps its reading and its standing for this long
+# before it is reported as not answering.
+REMOTE_GRACE = 10.0
 # Devices that are not storage of yours: compressed swap, loop-mounted
 # images, the RAM disks, network block devices and optical drives.
 SKIP_DISKS = ('loop', 'ram', 'zram', 'nbd', 'sr', 'fd', 'md')
@@ -243,6 +247,13 @@ def unescape(text):
     # mountinfo escapes space, tab, newline and backslash as octal.
     return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), text)
 
+# Kernel trees whose mounts are never a place your files live. Matched as the
+# directory itself or something under it: /development is a real mount.
+HIDDEN_TREES = ('/proc', '/sys', '/dev', '/run/credentials')
+
+def hidden(mount):
+    return any(mount == tree or mount.startswith(tree + '/') for tree in HIDDEN_TREES)
+
 def physical_of(name, depth=0):
     """The physical disk under a block device: through dm and partitions."""
     if depth > 8 or not name:
@@ -304,27 +315,31 @@ def mounts(raw=None):
         dev, mount, opts = h[2], unescape(h[4]), h[5]
         fstype, source = t[0], unescape(t[1])
         superopts = t[2] if len(t) > 2 else ''
-        if fstype in PSEUDO_FS or mount.startswith(('/proc', '/sys', '/dev', '/run/credentials')):
+        if fstype in PSEUDO_FS or hidden(mount):
             continue
         remote = fstype in NETWORK_FS or (fstype.startswith('fuse') and fstype != 'fuseblk')
         key = dev if not remote else dev + ':' + source
-        if key in rows:
-            row = rows[key]
-            if len(mount) < len(row['mount']):
-                row['also'].append(row['mount'])
-                row['mount'] = mount
-            else:
-                row['also'].append(mount)
-            continue
         options = set(opts.split(',')) | set(superopts.split(','))
         compress = next((o.partition('=')[2] or 'yes' for o in options if o == 'compress' or o.startswith('compress=') or o.startswith('compress-force=')), '')
         subvol = next((o[7:] for o in options if o.startswith('subvol=')), '')
         name = device_name(source) if not remote else ''
-        rows[key] = {'mount': mount, 'also': [], 'fstype': fstype, 'source': source,
-                     'remote': remote, 'device': physical_of(name) if name else '',
-                     'block': name, 'encrypted': encrypted(name) if name else False,
-                     'readonly': 'ro' in opts.split(','), 'compress': compress, 'subvol': subvol,
-                     'flags': sorted(o for o in ('ssd', 'discard', 'noatime', 'autodefrag', 'degraded') if o in options)}
+        entry = {'mount': mount, 'also': [], 'fstype': fstype, 'source': source,
+                 'remote': remote, 'device': physical_of(name) if name else '',
+                 'block': name, 'encrypted': encrypted(name) if name else False,
+                 'readonly': 'ro' in opts.split(','), 'compress': compress, 'subvol': subvol,
+                 'flags': sorted(o for o in ('ssd', 'discard', 'noatime', 'autodefrag', 'degraded') if o in options)}
+        if key in rows:
+            row = rows[key]
+            if len(mount) < len(row['mount']):
+                # The shorter path leads the row, and every per-mount fact --
+                # read-only, subvolume, noatime -- comes with it. Only the
+                # list of other mounts carries over.
+                entry['also'] = row['also'] + [row['mount']]
+                rows[key] = entry
+            else:
+                row['also'].append(mount)
+            continue
+        rows[key] = entry
         order.append(key)
     out = [rows[k] for k in order]
     for row in out:
@@ -332,20 +347,26 @@ def mounts(raw=None):
     return out
 
 class RemoteProbe:
-    """statvfs on a helper thread with a deadline, one probe in flight per mount.
+    """statvfs on helper threads with one shared deadline, one probe per mount.
 
     A share that has stopped answering costs one thread that finishes when the
-    server does, never a second one, and the dashboard keeps the last figures
-    it saw, marked unresponsive, rather than freezing every other reading.
+    server does, never a second one. Every remote mount is asked at once and
+    waited for together, so twelve dead shares cost one deadline per sample,
+    not twelve. The last good reading is kept and handed back, marked
+    unresponsive, while a probe is pending or the latest attempt failed, so a
+    hiccup never erases a capacity the reader already had.
     """
     def __init__(self):
-        self.results = {}
+        self.good = {}
+        self.failed = set()
         self.pending = {}
+        self.started = {}
         self.lock = threading.Lock()
 
     def _probe(self, mount):
         # Whatever the probe raises, the mount must leave the pending set, or
         # it would be reported as hung until the recorder restarts.
+        result = None
         try:
             value = os.statvfs(mount)
             result = (value.f_frsize * value.f_blocks, value.f_frsize * value.f_bavail, value.f_frsize * value.f_bfree)
@@ -353,25 +374,57 @@ class RemoteProbe:
             result = None
         finally:
             with self.lock:
-                self.results[mount] = (time.monotonic(), result)
+                if result is not None:
+                    self.good[mount] = (time.monotonic(), result)
+                    self.failed.discard(mount)
+                else:
+                    self.failed.add(mount)
                 self.pending.pop(mount, None)
 
-    def __call__(self, mount):
+    def start(self, mount):
         with self.lock:
-            thread = self.pending.get(mount)
-            if thread is None:
-                thread = threading.Thread(target=self._probe, args=(mount,), daemon=True)
-                self.pending[mount] = thread
+            if mount in self.pending:
+                return
+            thread = threading.Thread(target=self._probe, args=(mount,), daemon=True)
+            self.pending[mount] = thread
+            self.started[mount] = time.monotonic()
+            try:
                 thread.start()
-        thread.join(REMOTE_DEADLINE)
+            except Exception:
+                # A thread that never started must not sit in the pending set
+                # as if it were running; the next sample simply asks again.
+                self.pending.pop(mount, None)
+                self.failed.add(mount)
+
+    def wait(self, mounts, deadline=None):
+        """Wait for the given probes against one deadline shared by all."""
+        until = time.monotonic() + (REMOTE_DEADLINE if deadline is None else deadline)
+        for mount in mounts:
+            with self.lock:
+                thread = self.pending.get(mount)
+            if thread is None:
+                continue
+            remaining = until - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
+
+    def read(self, mount):
         with self.lock:
-            stamp, value = self.results.get(mount, (0, None))
-            responsive = mount not in self.pending
+            value = self.good.get(mount, (0, None))[1]
+            waiting = time.monotonic() - self.started.get(mount, 0) if mount in self.pending else 0
+            slow_but_known = mount in self.pending and value is not None and waiting < REMOTE_GRACE
+            responsive = mount not in self.failed and (mount not in self.pending or slow_but_known)
         return value, responsive
 
-def usage(row, probe):
+    def __call__(self, mount, wait=True):
+        self.start(mount)
+        if wait:
+            self.wait([mount])
+        return self.read(mount)
+
+def usage(row, probe, wait=True):
     if row['remote']:
-        value, responsive = probe(row['mount'])
+        value, responsive = probe(row['mount'], wait)
     else:
         try:
             v = os.statvfs(row['mount'])
@@ -380,6 +433,8 @@ def usage(row, probe):
             value, responsive = None, False
     row['responsive'] = responsive
     if not value:
+        # Nothing known, or nothing known yet. Capacity is null, never zero:
+        # zero free is a full disk, and this is not that.
         row.update(total=0, free=0, used=0, freePct=None, usedPct=None)
         return row
     total, avail, free = value
@@ -460,8 +515,11 @@ def disks(previous=None, now=None):
             elapsed = now - earlier['monotonic']
             delta = [a - b for a, b in zip(counters, earlier['counters'])]
             # A reset or a wrapped counter reads as no traffic for one sample
-            # rather than as a negative or an absurd spike.
-            if elapsed > 0 and all(d >= 0 for d in delta[:11]):
+            # rather than as a negative or an absurd spike. Field 9 (index 8)
+            # is requests in flight, a gauge that falls as work completes; it
+            # is the one field that may legitimately go down and must not be
+            # mistaken for a reset, or every quiet moment erases a sample.
+            if elapsed > 0 and all(d >= 0 for i, d in enumerate(delta[:11]) if i != 8):
                 rates['read'] = delta[2] * SECTOR / elapsed
                 rates['write'] = delta[6] * SECTOR / elapsed
                 rates['readIops'] = delta[0] / elapsed
@@ -518,11 +576,21 @@ def btrfs_pools():
             continue
         spaces = {}
         raw_allocated = 0
-        for kind in ('data', 'metadata', 'system'):
+        # mixed is the fourth space, on filesystems whose data and metadata
+        # share block groups; leaving it out would count those chunks as
+        # unallocated and show an empty pool.
+        for kind in ('data', 'metadata', 'system', 'mixed'):
             folder = alloc / kind
             if not folder.is_dir():
                 continue
-            profile = next((p for p in BTRFS_PROFILES if (folder / p).is_dir()), '')
+            # The kernel creates a profile directory when the first block
+            # group of that profile appears and keeps it until unmount, so
+            # after a conversion the old, empty profile is still listed.
+            # Only a profile that holds bytes is current; during a
+            # conversion two do, and both are named.
+            present = [p for p in BTRFS_PROFILES if (folder / p).is_dir()]
+            live = [p for p in present if read_int(folder / p / 'total_bytes') > 0]
+            profile = '+'.join(live) if live else (present[0] if present else '')
             disk_total = read_int(folder / 'disk_total')
             raw_allocated += disk_total
             spaces[kind] = {'used': read_int(folder / 'bytes_used'), 'total': read_int(folder / 'total_bytes'),
@@ -630,11 +698,20 @@ def smart(query=None):
                 'removable': bool(drive.get('Removable', False)), 'kind': 'none'}
         ata = ifaces.get('org.freedesktop.UDisks2.Drive.Ata')
         nvme = ifaces.get('org.freedesktop.UDisks2.NVMe.Controller')
-        if nvme:
+        # udisks documents that every Smart* property is meaningless until
+        # SmartUpdated is non-zero, and that some unknowns are sentinels: -1
+        # for ATA sector and attribute counts, 0 for power-on time. A drive
+        # that has not been read yet is reported as unread, not as healthy.
+        if nvme and not (nvme.get('SmartUpdated') or 0):
+            info.update(kind='none', reason='SMART not read yet')
+        elif ata and ata.get('SmartSupported') and not (ata.get('SmartUpdated') or 0):
+            info.update(kind='none', reason='SMART not read yet')
+        elif nvme:
             kelvin = nvme.get('SmartTemperature') or 0
             warnings = nvme.get('SmartCriticalWarning') or []
+            hours = nvme.get('SmartPowerOnHours') or 0
             info.update(kind='nvme', temp=round(kelvin - 273.15, 1) if kelvin else None,
-                        powerOnHours=nvme.get('SmartPowerOnHours'), warnings=[str(w) for w in warnings],
+                        powerOnHours=hours if hours > 0 else None, warnings=[str(w) for w in warnings],
                         selftest=str(nvme.get('SmartSelftestStatus', '')), updated=nvme.get('SmartUpdated'),
                         revision=str(nvme.get('NVMeRevision', '')))
             attrs = query(['call', 'org.freedesktop.UDisks2', path, 'org.freedesktop.UDisks2.NVMe.Controller', 'SmartGetAttributes', 'a{sv}', '0'])
@@ -650,9 +727,11 @@ def smart(query=None):
         elif ata and ata.get('SmartSupported'):
             kelvin = ata.get('SmartTemperature') or 0
             seconds = ata.get('SmartPowerOnSeconds') or 0
+            def known(value):
+                return value if isinstance(value, int) and value >= 0 else None
             info.update(kind='ata', temp=round(kelvin - 273.15, 1) if kelvin else None,
-                        powerOnHours=seconds // 3600 if seconds else None, failing=bool(ata.get('SmartFailing', False)),
-                        badSectors=ata.get('SmartNumBadSectors'), attributesFailing=ata.get('SmartNumAttributesFailing'),
+                        powerOnHours=seconds // 3600 if seconds > 0 else None, failing=bool(ata.get('SmartFailing', False)),
+                        badSectors=known(ata.get('SmartNumBadSectors')), attributesFailing=known(ata.get('SmartNumAttributesFailing')),
                         selftest=str(ata.get('SmartSelftestStatus', '')), updated=ata.get('SmartUpdated'), warnings=[])
         drives[path] = info
     out = {}
@@ -674,13 +753,15 @@ def metrics(previous=None, probe=None, cache=None):
     now = time.monotonic()
     ts = time.time()
     devices = disks({d['name']: d for d in previous['disks']} if previous else None, now)
-    if not devices and not previous:
-        # A machine with no disk of its own (a container, a diskless boot)
-        # still has filesystems; the drive cards simply stay empty.
-        pass
-    filesystems = [usage(row, probe) for row in mounts()]
-    if not filesystems:
-        raise RuntimeError('No mounted filesystem is visible')
+    # A machine with no disk of its own (a container, a diskless boot) still
+    # has filesystems, and a namespace with no eligible filesystem still has
+    # drives and pressure. Neither empties the other.
+    rows = mounts()
+    for row in rows:
+        if row['remote']:
+            probe.start(row['mount'])
+    probe.wait([row['mount'] for row in rows if row['remote']])
+    filesystems = [usage(row, probe, wait=False) for row in rows]
     for fs in filesystems:
         fs['pool'] = ''
     pools = btrfs_pools()
@@ -714,11 +795,11 @@ def primary_of(m):
     for fs in m['filesystems']:
         if fs['mount'] == '/':
             return fs
-    return m['filesystems'][0]
+    return m['filesystems'][0] if m['filesystems'] else None
 
 def drive_of(m, fs):
     for d in m['disks']:
-        if d['name'] == fs.get('device'):
+        if fs and d['name'] == fs.get('device'):
             return d
     return max(m['disks'], key=lambda d: d['rates']['util'], default=None)
 
@@ -815,7 +896,7 @@ def record(db, m):
     fs = primary_of(m)
     drive = drive_of(m, fs)
     db.execute('INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?)',
-               (m['ts'], fs.get('usedPct'), m['rates']['read'], m['rates']['write'],
+               (m['ts'], fs.get('usedPct') if fs else None, m['rates']['read'], m['rates']['write'],
                 drive['rates']['util'] if drive else 0, m['psi'].get('some', {}).get('avg10', 0),
                 drive['temp'] if drive else None, read('/proc/sys/kernel/random/boot_id').strip()))
     db.execute('DELETE FROM samples WHERE ts < ?', (m['ts']-7*86400,))
@@ -996,13 +1077,15 @@ def flush():
         return {'message': f"Pending writes: {before.get('Dirty', 0)/1048576:.1f} → {after.get('Dirty', 0)/1048576:.1f} MiB in {time.monotonic()-started:.2f}s. Everything the kernel was holding is now on disk."}
 
 def snapshot():
-    # A one-shot reading needs two samples to carry a rate at all.
+    # A one-shot reading needs two samples to carry a rate at all, for the
+    # drives and for the processes alike.
     probe = RemoteProbe()
     cache = {'smart': smart(), 'smartAt': time.time(), 'trim': trim_status()}
     first = metrics(None, probe, cache)
+    _, counters = hogs()
     time.sleep(1)
     m = metrics(first, probe, cache)
-    m['hogs'] = hogs()[0]
+    m['hogs'] = hogs(counters)[0]
     return public(m)
 
 def main():
@@ -1016,8 +1099,13 @@ def main():
         if args.action == 'daemon':
             daemon()
             return
+        if args.action == 'snapshot':
+            # A one-shot reading touches nothing: no state directory, no mode
+            # repair, no dependence on a history it does not use.
+            print(json.dumps(snapshot()))
+            return
         prepare_state()
-        value = snapshot() if args.action == 'snapshot' else focus(args.pid, args.start) if args.action == 'focus' else flush()
+        value = focus(args.pid, args.start) if args.action == 'focus' else flush()
         print(json.dumps(value))
     except Exception as e:
         print(json.dumps({'error': str(e)}))

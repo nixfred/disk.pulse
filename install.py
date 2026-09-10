@@ -8,10 +8,15 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 
 PLUGIN_ID = 'nixfred.disk-pulse'
 FILES = ('manifest.json', 'Panel.qml', 'Model.js', 'DiskChip.qml',
          'HistoryGraph.qml', 'disk_pulse.py', 'README.md')
+# How long to give the shell's plugin scan before falling back to editing the
+# layout file directly. The scan is a subprocess and IPC answers before it
+# returns, so the first put after a rescan can honestly say "not ready".
+PLACEMENT_TRIES = 6
 
 
 def atomic_write(path, payload, mode):
@@ -76,6 +81,52 @@ def symlinked_ancestors(*paths):
     return sorted(found)
 
 
+def place_through_shell():
+    """Ask the running shell to put the widget on the bar, in its own writer.
+
+    The shell serialises every edit to shell.json through one mutator, so a
+    placement made this way cannot race a setting another widget saves in
+    the same second. put is the unattended verb: a widget that is already on
+    the bar stays where its owner put it. Returns True when the shell did it.
+    """
+    for attempt in range(PLACEMENT_TRIES):
+        try:
+            result = subprocess.run(['omarchy-shell', 'shell', 'putBarWidget', PLUGIN_ID, '{"section": "right"}'],
+                                    capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        answer = (getattr(result, 'stdout', '') or '').strip()
+        if result.returncode == 0 and answer == 'ok':
+            return True
+        if answer != 'not ready':
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def restore(backup, dest, unit, published):
+    """Put the previous release back after a failed publication.
+
+    A publication that fails half way would otherwise leave a new manifest
+    beside old QML, or new QML beside an old daemon, and the shell would load
+    the mixture. The rollback copies are the release that was running.
+    """
+    previous = backup / 'plugin'
+    for name in published:
+        source = previous / name
+        if source.is_file():
+            shutil.copy2(source, dest / name)
+        elif (dest / name).is_file():
+            (dest / name).unlink()
+    if not previous.exists() and dest.exists() and not any(dest.iterdir()):
+        dest.rmdir()
+    unit_copy = backup / 'disk-pulse.service'
+    if unit_copy.is_file():
+        shutil.copy2(unit_copy, unit)
+    elif 'disk-pulse.service' in published:
+        unit.unlink(missing_ok=True)
+
+
 def main():
     source = Path(__file__).resolve().parent
     home = Path.home()
@@ -86,8 +137,9 @@ def main():
     if linked:
         raise RuntimeError('Resolve symlinked install destinations explicitly '
                            'before installing: ' + ', '.join(linked))
-    raw = config.read_bytes()
-    updated = update_layout(raw)
+    # Validate the layout before anything is published, so a broken file
+    # stops the install rather than being discovered after the copy.
+    update_layout(config.read_bytes())
     config_mode = stat.S_IMODE(config.stat().st_mode) & 0o777
     payloads = {}
     for name in (*FILES, 'disk-pulse.service'):
@@ -105,20 +157,33 @@ def main():
         shutil.copytree(dest, backup / 'plugin', symlinks=True)
     if unit.exists():
         shutil.copy2(unit, backup / 'disk-pulse.service')
+
+    published = []
     try:
-        if config.read_bytes() != raw:
-            raise RuntimeError('shell.json changed during installation; no payload was published.')
         dest.mkdir(parents=True, exist_ok=True)
         unit.parent.mkdir(parents=True, exist_ok=True)
         for name in FILES:
             atomic_write(dest / name, *payloads[name])
+            published.append(name)
         atomic_write(unit, *payloads['disk-pulse.service'])
-        atomic_write(config, updated, config_mode)
+        published.append('disk-pulse.service')
+    except Exception:
+        restore(backup, dest, unit, published)
+        print('Publication failed; the previous release was put back. Rollback copies: ' + str(backup))
+        raise
+
+    try:
         for command in (['systemctl', '--user', 'daemon-reload'],
                         ['systemctl', '--user', 'enable', 'disk-pulse.service'],
                         ['systemctl', '--user', 'restart', 'disk-pulse.service'],
                         ['omarchy-shell', 'shell', 'rescanPlugins']):
             subprocess.run(command, check=True, timeout=30)
+        # The bar layout goes through the shell whenever the shell is there to
+        # take it. Without a shell (a headless install, a first boot) the file
+        # is edited directly, re-read at the moment of writing so a setting
+        # saved while the files were being copied is kept.
+        if not place_through_shell():
+            atomic_write(config, update_layout(config.read_bytes()), config_mode)
     except Exception:
         print('Install did not complete. Rollback copies: ' + str(backup))
         raise

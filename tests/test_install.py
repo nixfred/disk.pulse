@@ -22,7 +22,7 @@ from install import symlinked_ancestors  # noqa: E402
 
 class InstallerTests(unittest.TestCase):
     @contextlib.contextmanager
-    def installer_fixture(self, config_text=None, missing=None):
+    def installer_fixture(self, config_text=None, missing=None, runner=None):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             home, source = base / 'home', base / 'source'
@@ -45,9 +45,10 @@ class InstallerTests(unittest.TestCase):
             config.write_text(config_text if config_text is not None else json.dumps(data))
             config.chmod(0o600)
             def install():
-                with patch.object(Path, 'home', return_value=home), \
-                     patch('subprocess.run', return_value=SimpleNamespace(returncode=0)), \
-                     contextlib.redirect_stdout(io.StringIO()):
+                mocked = patch('subprocess.run', side_effect=runner) if runner else \
+                    patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=''))
+                with patch.object(Path, 'home', return_value=home), mocked, \
+                     patch('time.sleep'), contextlib.redirect_stdout(io.StringIO()):
                     runpy.run_path(str(source / 'install.py'), run_name='__main__')
             yield home, config, dest, unit, data, install
 
@@ -144,6 +145,63 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 install()
             self.assertEqual((dest / 'Panel.qml').read_text(), 'old plugin')
+
+    def test_setting_saved_during_publication_is_kept(self):
+        # Codex finding 2: another widget saved a setting while the files
+        # were being copied. The layout edit is applied to the file as it is
+        # at the moment of writing, so both changes survive.
+        holder = {}
+        def runner(command, **kwargs):
+            if 'rescanPlugins' in command:
+                current = json.loads(holder['config'].read_text())
+                current['bar']['layout']['right'][0]['pinned'] = True
+                holder['config'].write_text(json.dumps(current))
+            return SimpleNamespace(returncode=0, stdout='')
+        with self.installer_fixture(runner=runner) as (_, config, _, _, data, install):
+            holder['config'] = config
+            data['bar']['layout']['center'] = [{'id': 'workspace'}]
+            data['bar']['layout']['right'] = [{'id': 'tray'}]
+            config.write_text(json.dumps(data))
+            install()
+            layout = json.loads(config.read_text())['bar']['layout']
+            self.assertEqual(layout['right'], [{'id': 'tray', 'pinned': True},
+                {'id': 'nixfred.disk-pulse', 'displayMode': 0, 'animated': True}])
+
+    def test_shell_placement_wins_when_the_shell_answers(self):
+        # With a shell running, the layout goes through its serialised
+        # writer and the file is never edited by the installer.
+        def runner(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout='ok\n' if 'putBarWidget' in command else '')
+        with self.installer_fixture(runner=runner) as (_, config, _, _, data, install):
+            data['bar']['layout']['center'] = [{'id': 'workspace'}]
+            data['bar']['layout']['right'] = [{'id': 'tray'}]
+            config.write_text(json.dumps(data))
+            install()
+            self.assertEqual(json.loads(config.read_text()), data)
+
+    def test_shell_not_ready_falls_back_to_the_file(self):
+        def runner(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout='not ready\n' if 'putBarWidget' in command else '')
+        with self.installer_fixture(runner=runner) as (_, config, _, _, data, install):
+            data['bar']['layout']['center'] = [{'id': 'workspace'}]
+            data['bar']['layout']['right'] = []
+            config.write_text(json.dumps(data))
+            install()
+            self.assertEqual(json.loads(config.read_text())['bar']['layout']['right'],
+                             [{'id': 'nixfred.disk-pulse', 'displayMode': 0, 'animated': True}])
+
+    def test_publication_failure_restores_the_previous_release(self):
+        # Codex finding 11: a failure half way through the copy used to leave
+        # a new manifest beside the old implementation.
+        with self.installer_fixture() as (_, config, dest, unit, data, install):
+            (dest / 'HistoryGraph.qml').mkdir()
+            with self.assertRaises(OSError):
+                install()
+            self.assertEqual((dest / 'Panel.qml').read_text(), 'old plugin')
+            self.assertFalse((dest / 'manifest.json').exists())
+            self.assertFalse((dest / 'Model.js').exists())
+            self.assertEqual(unit.read_text(), 'old unit')
+            self.assertEqual(json.loads(config.read_text()), data)
 
     def test_symlinked_home_does_not_block_install(self):
         with self.installer_fixture() as (home, _, dest, _, _, install):

@@ -136,7 +136,7 @@ cd disk.pulse
 python3 install.py
 ```
 
-Installs under `~/.config/omarchy/plugins/nixfred.disk-pulse`, appends to the far-right bar, and enables `disk-pulse.service` for the graphical session. Existing files and bar layout are backed up under `~/.local/state/omarchy/backups/disk-pulse-TIMESTAMP/`.
+Installs under `~/.config/omarchy/plugins/nixfred.disk-pulse`, appends to the far-right bar, and enables `disk-pulse.service` for the graphical session. Existing files and bar layout are backed up under `~/.local/state/omarchy/backups/disk-pulse-TIMESTAMP/`. The bar placement goes through the running shell's own configuration writer, so it cannot race a setting another widget saves at the same moment; without a shell the layout file is edited directly. A publication that fails half way puts the previous release back rather than leaving new QML beside an old daemon.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="How it works: kernel and udisks sources feed the recorder, which writes a private snapshot and SQLite history that the bar widget reads" width="100%">
@@ -181,7 +181,9 @@ The write trace takes the theme accent, busy time takes the ramp's warning stop,
 
 Free space is what this user can still write, `f_bavail` from `statvfs`, the number `df` prints as *Avail*. Used is everything that is not free to root, `total − f_bfree`, which is `df`'s *Used*: on btrfs it includes metadata chunks and on ext4 the reserved blocks, so free and used do not always sum to the size. Capacity is in binary units the way `df -h` counts, so the panel agrees with your terminal.
 
-Throughput and lifetime totals are decimal, the way drives are sold and benchmarks are quoted: 1 MB/s is 1,000,000 bytes per second. Rates are the delta of the kernel's per-disk counters over the sampling interval, sectors of 512 bytes regardless of the drive's block size, summed across physical disks; a LUKS or LVM mapping is not counted a second time. Busy is the fraction of wall time the drive had at least one request in flight, and is capped at 100% on multi-queue devices that can report more. Per-request latency is the drive's own accounting of time spent on completed requests. A counter reset reads as no traffic for one sample rather than a spike.
+Throughput and lifetime totals are decimal, the way drives are sold and benchmarks are quoted: 1 MB/s is 1,000,000 bytes per second. Rates are the delta of the kernel's per-disk counters over the sampling interval, sectors of 512 bytes regardless of the drive's block size, summed across physical disks; a LUKS or LVM mapping is not counted a second time. Busy is the fraction of wall time the drive had at least one request in flight, and is capped at 100% on multi-queue devices that can report more. Per-request latency is the drive's own accounting of time spent on completed requests. A counter reset reads as no traffic for one sample rather than a spike; the in-flight field is a gauge that falls as work completes and is never mistaken for one.
+
+Network and userspace filesystems are probed on helper threads against one shared deadline, so a dozen dead shares cost one deadline per sample, not a dozen. A share that is not answering, or whose probe failed, keeps the last capacity it reported and is marked as such; capacity that was never read is unknown, and unknown is never painted as full. `discard_bytes_saved` on the pool card counts extents reused before a discard was due, which is work spared, not bytes trimmed.
 
 Per-process traffic is `read_bytes` and `write_bytes` from `/proc`, which count what actually reached the storage layer — not `rchar` and `wchar`, which count reads the page cache answered. Rates are the delta since the last 9-second scan, keyed by PID and start time so a recycled PID never inherits a rate. Only your own processes expose these counters without privilege, so a system service thrashing the drive shows in the drive's own figures rather than in the hog list.
 

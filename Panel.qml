@@ -65,13 +65,24 @@ Panel {
     readonly property var primary: Model.primaryOf(disk, mountpoint)
     readonly property var drive: Model.driveOf(disk, primary)
     readonly property var hero: Model.heroAmount(primary ? primary.free : 0)
-    readonly property color tint: stale ? themeMuted : Model.ramp(primary ? primary.freePct : 0,rampPalette)
+    // Capacity that has not been read is unknown, not zero: the chip goes to
+    // the theme's muted colour with an empty map rather than a full red one.
+    readonly property bool capacityKnown: primary !== null && primary.responsive !== false && Model.has(primary.freePct)
+    readonly property real chipFree: capacityKnown ? primary.freePct : 100
+    readonly property color tint: stale || !capacityKnown ? themeMuted : Model.ramp(primary.freePct,rampPalette)
+    property int fsPage: 0
+    readonly property int fsPerPage: 5
     readonly property real pressure: disk.psi && disk.psi.some ? disk.psi.some.avg10 : 0
     readonly property var rates: disk.rates || {}
     readonly property var rows: disk.hogs || []
     // Telemetry can shorten the list under a reader who is already paging.
     onRowsChanged: page=Math.min(page,Math.max(0,Math.ceil(rows.length/8)-1))
     readonly property var filesystems: disk.filesystems || []
+    // A box with a dozen mounts must not push the overview off a 1080p
+    // screen, so the card shows five at a time and pages in its header.
+    onFilesystemsChanged: fsPage=Math.min(fsPage,Math.max(0,Math.ceil(filesystems.length/fsPerPage)-1))
+    readonly property var fsListing: filesystems.slice(fsPage*fsPerPage,fsPage*fsPerPage+fsPerPage)
+    readonly property int fsPages: Math.max(1,Math.ceil(filesystems.length/fsPerPage))
     readonly property var disks: disk.disks || []
     readonly property var chart: histories[String(range)] || {points:[],seconds:range,now:now,bucket:15,count:0,peakRead:0,peakWrite:0}
     // Traffic is normalised against the busiest quarter-minute of the last
@@ -131,7 +142,7 @@ Panel {
         var health=s.kind==='nvme'?(s.warnings&&s.warnings.length?s.warnings.join(', '):'OK'):s.kind==='ata'?(s.failing?'FAILING':'OK'):'—'
         return [
             {l:'TEMPERATURE',v:Model.temp(d.temp),h:Model.has(d.tempMax)?'warns at '+Model.temp(d.tempMax)+(Model.has(d.tempCrit)?' · critical '+Model.temp(d.tempCrit):''):'no drive sensor exposed'},
-            {l:'SMART HEALTH',v:health,h:s.kind==='nvme'?'NVMe critical warning flags':s.kind==='ata'?'overall assessment via udisks':'udisks reports no SMART'},
+            {l:'SMART HEALTH',v:health,h:s.kind==='nvme'?'NVMe critical warning flags':s.kind==='ata'?'overall assessment via udisks':(s.reason||'udisks reports no SMART')},
             {l:'DRIVE WEAR',v:s.kind==='nvme'&&Model.has(s.percentUsed)?Model.whole(s.percentUsed):s.kind==='ata'&&Model.has(s.badSectors)?String(s.badSectors)+' bad sectors':'—',h:s.kind==='nvme'?'of rated endurance used':s.kind==='ata'?'reallocated or pending':'not reported'},
             {l:'POWERED ON',v:Model.hours(s.powerOnHours),h:Model.has(s.powerCycles)?String(s.powerCycles)+' power cycles':'lifetime'},
             {l:'WRITTEN · LIFETIME',v:Model.has(s.totalWritten)?Model.dec(s.totalWritten):'—',h:Model.has(s.totalRead)?'read '+Model.dec(s.totalRead):'host writes to the drive'},
@@ -145,17 +156,26 @@ Panel {
         ]
     }
     function poolStats(p) {
-        var sp=p.spaces||{}, data=sp.data||{}, meta=sp.metadata||{}, e=p.errors||{}, c=p.commits||{}
-        return [
+        var sp=p.spaces||{}, data=sp.data||{}, meta=sp.metadata||{}, mixed=sp.mixed, e=p.errors||{}, c=p.commits||{}
+        // A pool made with mixed block groups keeps data and metadata in one
+        // space; it has no separate data or metadata figures to show.
+        var head=mixed?[
+            {l:'DATA + METADATA',v:Model.size(mixed.used),h:'of '+Model.size(mixed.total)+' allocated · mixed chunks'},
+            {l:'MIXED PROFILE',v:mixed.profile||'single',h:'data and metadata share block groups'}
+        ]:[
             {l:'DATA',v:Model.size(data.used),h:'of '+Model.size(data.total)+' allocated · '+(data.profile||'single')},
-            {l:'METADATA',v:Model.size(meta.used),h:'of '+Model.size(meta.total)+(meta.profile==='dup'?' · DUP, ×2 on disk':' · '+(meta.profile||'single'))},
+            {l:'METADATA',v:Model.size(meta.used),h:'of '+Model.size(meta.total)+(meta.profile==='dup'?' · DUP, ×2 on disk':' · '+(meta.profile||'single'))}
+        ]
+        return head.concat([
             {l:'UNALLOCATED',v:Model.size(p.unallocated),h:'raw space no chunk has claimed'},
             {l:'GLOBAL RESERVE',v:Model.size(p.globalReserve?p.globalReserve.size:0),h:'so metadata can always commit'},
             {l:'DEVICE ERRORS',v:String(p.errorTotal||0),h:'r '+(e.read_errs||0)+' · w '+(e.write_errs||0)+' · flush '+(e.flush_errs||0)+' · corrupt '+(e.corruption_errs||0)},
             {l:'LAST COMMIT',v:Model.ms(c.last_commit_ms),h:'slowest '+Model.ms(c.max_commit_ms)+' · '+Model.count(c.commits)+' commits'},
-            {l:'DISCARD SAVED',v:Model.size(p.discardSaved),h:'trimmed since mount'},
+            // discard_bytes_saved counts extents reused before a discard was
+            // due, which is work the drive was spared, not bytes trimmed.
+            {l:'DISCARD SAVED',v:Model.size(p.discardSaved),h:'reused before a discard was due'},
             {l:'COMPRESSION',v:root.primary&&root.primary.compress?root.primary.compress:'off',h:(p.features||[]).indexOf('compress_zstd')>=0?'zstd in use on this pool':'mount option'}
-        ]
+        ])
     }
     // Dirty and writeback pages are the kernel's side of storage; the trim
     // timer is the drive's housekeeping. Both belong beside the pool.
@@ -229,7 +249,7 @@ Panel {
         onPressed:function(b){if(b===Qt.RightButton){root.chooseMode=true;root.open()}else{root.chooseMode=false;root.toggle()}}
         Row {
             id:barRow;anchors.centerIn:parent;spacing:4
-            DiskChip {compact:true;body:root.themeBg;glint:root.barForeground;free:root.primary?root.primary.freePct||0:0;activity:root.activity;reading:root.reading;writing:root.writing;tint:root.tint;animate:!root.stale && root.setting('animated',true)}
+            DiskChip {compact:true;body:root.themeBg;glint:root.barForeground;free:root.chipFree;activity:root.activity;reading:root.reading;writing:root.writing;tint:root.tint;animate:!root.stale && root.setting('animated',true)}
             Column {
                 visible:root.showReadout
                 anchors.verticalCenter:parent.verticalCenter
@@ -341,17 +361,17 @@ Panel {
                     Rectangle {
                         width:parent.width;height:170;radius:16;border.color:Qt.alpha(root.tint,0.45)
                         gradient:Gradient {GradientStop{position:0;color:Qt.alpha(root.tint,0.13)}GradientStop{position:1;color:root.surface}}
-                        DiskChip {id:heroChip;body:root.themeBg;glint:root.themeText;x:12;y:5;width:160;height:160;free:root.primary?root.primary.freePct||0:0;activity:root.activity;reading:root.reading;writing:root.writing;tint:root.tint;animate:root.opened&&root.tab===0&&!root.stale&&root.setting('animated',true)}
+                        DiskChip {id:heroChip;body:root.themeBg;glint:root.themeText;x:12;y:5;width:160;height:160;free:root.chipFree;activity:root.activity;reading:root.reading;writing:root.writing;tint:root.tint;animate:root.opened&&root.tab===0&&!root.stale&&root.setting('animated',true)}
                         Column {x:188;y:20;spacing:6
                             Label{text:'FREE SPACE ON '+(root.primary?root.primary.mount:root.mountpoint).toUpperCase();font.pixelSize:11;font.letterSpacing:2}
                             Row {spacing:10
-                                Text {text:root.stale||!root.primary?'—':root.hero.value;color:root.themeText;font.pixelSize:52;font.family:root.themeFont;font.weight:Font.Light}
+                                Text {text:root.stale||!root.capacityKnown?'—':root.hero.value;color:root.themeText;font.pixelSize:52;font.family:root.themeFont;font.weight:Font.Light}
                                 Label{text:root.hero.unit;font.pixelSize:18;anchors.bottom:parent.bottom;anchors.bottomMargin:10}
                             }
-                            Label{text:root.primary?Model.pct(root.primary.freePct)+' free  /  '+Model.size(root.primary.total)+' '+root.primary.fstype+(root.primary.encrypted?' on LUKS':'')+(root.drive?' · '+root.drive.transport:''):'No filesystem is mounted at '+root.mountpoint;color:root.themeSoft}
+                            Label{text:!root.primary?'No filesystem is mounted at '+root.mountpoint:!root.capacityKnown?(root.primary.responsive===false?'Not answering':'Capacity not read yet')+'  ·  '+root.primary.fstype+(root.primary.remote?' · remote':''):Model.pct(root.primary.freePct)+' free  /  '+Model.size(root.primary.total)+' '+root.primary.fstype+(root.primary.encrypted?' on LUKS':'')+(root.drive?' · '+root.drive.transport:'');color:root.themeSoft}
                             Label{text:'Used = size − free, including filesystem metadata.';font.pixelSize:10}
                         }
-                        Text {anchors.right:parent.right;anchors.rightMargin:20;anchors.top:parent.top;anchors.topMargin:22;text:(root.primary?Model.pct(root.primary.usedPct):'—')+'\nused';color:Qt.alpha(root.themeText,0.5);font.pixelSize:15;horizontalAlignment:Text.AlignRight;font.family:root.themeFont}
+                        Text {anchors.right:parent.right;anchors.rightMargin:20;anchors.top:parent.top;anchors.topMargin:22;text:(root.capacityKnown?Model.pct(root.primary.usedPct):'—')+'\nused';color:Qt.alpha(root.themeText,0.5);font.pixelSize:15;horizontalAlignment:Text.AlignRight;font.family:root.themeFont}
                     }
                     Row {width:parent.width;spacing:10
                         Stat{width:(parent.width-30)/4;height:96;label:'READING';value:Model.rate(root.rates.read);hint:Model.perSec(root.rates.readIops)+' · all drives'}
@@ -384,24 +404,30 @@ Panel {
                     }
                     Rectangle {width:parent.width;height:fsColumn.implicitHeight+28;radius:14;color:root.surface;border.color:root.stroke
                         Column{id:fsColumn;anchors.left:parent.left;anchors.right:parent.right;anchors.top:parent.top;anchors.margins:14;spacing:9
-                            Row{width:parent.width
-                                Heading{text:'FILESYSTEMS';font.pixelSize:12;width:parent.width/2}
-                                Label{text:root.filesystems.length+' mounted  ·  click one to follow it';width:parent.width/2;horizontalAlignment:Text.AlignRight;font.pixelSize:10}
+                            Item{width:parent.width;height:22
+                                Heading{text:'FILESYSTEMS';font.pixelSize:12;anchors.left:parent.left;anchors.verticalCenter:parent.verticalCenter}
+                                Row{anchors.right:parent.right;anchors.verticalCenter:parent.verticalCenter;spacing:6
+                                    Label{visible:root.fsPages<=1;text:root.filesystems.length+' mounted  ·  click one to follow it';font.pixelSize:10;anchors.verticalCenter:parent.verticalCenter}
+                                    Action{visible:root.fsPages>1;text:'‹';implicitWidth:30;implicitHeight:22;opacity:root.fsPage>0?1:0.4;onClicked:root.fsPage=Math.max(0,root.fsPage-1)}
+                                    Label{visible:root.fsPages>1;text:(root.fsPage+1)+' / '+root.fsPages+'  ·  '+root.filesystems.length+' mounted';font.pixelSize:10;anchors.verticalCenter:parent.verticalCenter}
+                                    Action{visible:root.fsPages>1;text:'›';implicitWidth:30;implicitHeight:22;opacity:root.fsPage+1<root.fsPages?1:0.4;onClicked:root.fsPage=Math.min(root.fsPages-1,root.fsPage+1)}
+                                }
                             }
-                            Repeater{model:root.filesystems
+                            Repeater{model:root.fsListing
                                 Item {
                                     id:fsRow
                                     required property var modelData
-                                    width:fsColumn.width;height:34
+                                    width:fsColumn.width;height:30
                                     readonly property bool followed:modelData.mount===(root.primary?root.primary.mount:'')
-                                    readonly property color own:fsRow.modelData.freePct===null||fsRow.modelData.freePct===undefined?root.themeMuted:Model.ramp(fsRow.modelData.freePct,root.rampPalette)
-                                    Row{width:parent.width;y:2
+                                    readonly property bool known:modelData.responsive!==false&&Model.has(modelData.freePct)
+                                    readonly property color own:known?Model.ramp(fsRow.modelData.freePct,root.rampPalette):root.themeMuted
+                                    Row{width:parent.width;y:0
                                         Label{width:parent.width*0.55;elide:Text.ElideRight;font.pixelSize:11;color:fsRow.followed?root.themeText:root.themeSoft;font.bold:fsRow.followed
                                             text:fsRow.modelData.mount+'  ·  '+fsRow.modelData.fstype+(root.fsBadges(fsRow.modelData)?'  ·  '+root.fsBadges(fsRow.modelData):'')+(fsRow.modelData.also&&fsRow.modelData.also.length?'  ·  also '+root.alsoList(fsRow.modelData.also):'')}
                                         Label{width:parent.width*0.45;horizontalAlignment:Text.AlignRight;font.pixelSize:11;color:root.themeSoft
-                                            text:fsRow.modelData.responsive===false?'not answering':fsRow.modelData.total?Model.size(fsRow.modelData.free)+' free  ·  '+Model.size(fsRow.modelData.used)+' of '+Model.size(fsRow.modelData.total):'—'}
+                                            text:fsRow.modelData.responsive===false?'not answering'+(Model.has(fsRow.modelData.freePct)?'  ·  last seen '+Model.size(fsRow.modelData.free)+' free':''):Model.has(fsRow.modelData.freePct)?Model.size(fsRow.modelData.free)+' free  ·  '+Model.size(fsRow.modelData.used)+' of '+Model.size(fsRow.modelData.total):'capacity not read'}
                                     }
-                                    Rectangle{y:23;width:parent.width;height:5;radius:3;color:root.stroke
+                                    Rectangle{y:21;width:parent.width;height:5;radius:3;color:root.stroke
                                         Rectangle{width:parent.width*Model.clamp(fsRow.modelData.total?fsRow.modelData.used/fsRow.modelData.total:0,0,1);height:parent.height;radius:3;color:fsRow.own;Behavior on width{NumberAnimation{duration:800}}}
                                     }
                                     MouseArea{anchors.fill:parent;cursorShape:Qt.PointingHandCursor;onClicked:root.setMountpoint(fsRow.modelData.mount)}
@@ -494,7 +520,7 @@ Panel {
                         gradient:Gradient {GradientStop{position:0;color:Qt.alpha(root.tint,0.13)}GradientStop{position:1;color:root.surface}}
                         // Still, not animated: an About tab should not be the
                         // most expensive thing the panel draws.
-                        DiskChip {x:14;y:6;body:root.themeBg;glint:root.themeText;width:120;height:120;free:root.primary?root.primary.freePct||0:0;tint:root.tint;animate:false}
+                        DiskChip {x:14;y:6;body:root.themeBg;glint:root.themeText;width:120;height:120;free:root.chipFree;tint:root.tint;animate:false}
                         Column {x:152;y:26;spacing:6
                             Label{text:'VERSION';font.pixelSize:11;font.letterSpacing:2}
                             Heading{text:root.pluginVersion || 'unavailable';font.pixelSize:34;font.letterSpacing:1}

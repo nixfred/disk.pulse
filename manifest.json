@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nixfred.disk-pulse",
   "name": "Disk Pulse",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Fred Nix",
   "license": "MIT",
   "description": "A living storage die: free space, read and write throughput, drive busy time, I/O pressure, drive temperature and SMART health, btrfs allocation, seven-day history, and focus-only disk hogs.",

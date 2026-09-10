@@ -49,6 +49,15 @@ assert.equal(ctx.healthLabel({...m,psi:{some:{avg10:15}}},root,drive,false),'STO
 assert.equal(ctx.healthLabel(m,root,{...drive,temp:85},false),'DRIVE IS RUNNING HOT');
 assert.equal(ctx.healthLabel(m,root,{...drive,rates:{util:90}},false),'DRIVE IS SATURATED');
 
+// Codex finding 6: unknown capacity is unknown, never full. A share that is
+// not answering, or a filesystem whose capacity was never read, must not
+// become 0% free, a red die and a "nearly full" alarm.
+assert.equal(ctx.healthLabel(m,{...root,freePct:null,usedPct:null,responsive:true},drive,false),'CAPACITY UNKNOWN');
+assert.equal(ctx.healthLabel(m,{...root,responsive:false},drive,false),'CAPACITY UNKNOWN');
+assert.equal(ctx.readout({...m,filesystems:[{...root,freePct:null,usedPct:null,free:0,used:0}]},0),'—');
+assert.equal(ctx.readout({...m,filesystems:[{...root,freePct:null,usedPct:null,free:0,used:0}]},2),'—');
+assert.equal(ctx.readout({...m,filesystems:[{...root,freePct:null}]},4),'R 37.2M');
+
 // Width reservations: every mode whose text changes each sample reserves the
 // widest string it can produce; the amount modes reserve nothing.
 assert.equal(ctx.widestReadout(0),'100.0%');assert.equal(ctx.widestReadout(4),'R 99.9M');assert.equal(ctx.widestReadout(5),'99°C');
@@ -74,4 +83,6 @@ for(const [xdg,expected] of [['','/home/test/.local/state/disk-pulse'],['relativ
 assert.ok(panel.includes('model:6'),'the picker must list six modes');
 assert.ok(panel.includes('event.key<=Qt.Key_6'),'keys 1-6 must pick a mode');
 assert.ok(panel.includes("Model.clamp(setting('displayMode',0),0,5)"),'the mode setting must clamp to six modes');
+assert.ok(panel.includes('capacityKnown'),'the panel must gate capacity rendering on a known reading');
+assert.ok(panel.includes('fsPerPage'),'the filesystem card must page rather than grow without bound');
 console.log('Readout formats, mount following, units, health labels, width reservations, axis ceilings and state-directory agreement pass.');

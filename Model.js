@@ -245,7 +245,7 @@ function readout(m, mode, mountpoint) {
     var p = primaryOf(m, mountpoint)
     if (mode === 4) return 'R '+tight(m.rates ? m.rates.read : 0)
     if (mode === 5) { var d = driveOf(m, p); return temp(d ? d.temp : null) }
-    if (!p) return '—'
+    if (!p || !has(p.freePct)) return '—'
     if (mode === 1) return pct(p.usedPct)
     if (mode === 2) return size(p.free)
     if (mode === 3) return size(p.used)
@@ -284,6 +284,9 @@ function modeName(mode) { return ['% free', '% used', 'Amount free', 'Amount use
 // temperature is still doing its job.
 function healthLabel(m, primary, drive, stale) {
     if (stale || !m || !m.warm) return 'WAITING FOR TELEMETRY'
+    // A share that is not answering, or a filesystem whose capacity has not
+    // been read, is unknown. Unknown is not full: null must never become 0%.
+    if (primary && (primary.responsive === false || !has(primary.freePct))) return 'CAPACITY UNKNOWN'
     var psi = m.psi && m.psi.some ? num(m.psi.some.avg10) : 0
     var free = primary ? num(primary.freePct) : 100
     var util = drive && drive.rates ? num(drive.rates.util) : 0
