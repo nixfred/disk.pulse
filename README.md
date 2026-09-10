@@ -25,6 +25,29 @@ Left-click opens the dashboard. Right-click offers six saved readouts: percentag
 
 Disk Pulse is the sibling of [RAM Pulse](https://github.com/nixfred/ram.plugin.omarchy), [CPU Pulse](https://github.com/nixfred/omacpu) and [Net Pulse](https://github.com/nixfred/omanet.plugin.omarchy): same chip, same colours, same dashboard layout, so the four sit together on the bar.
 
+## The die
+
+<table>
+  <tr>
+    <td width="220" valign="top" align="center">
+      <img src="docs/die.gif" alt="The storage die animating: a block map lit from the bottom as the filesystem fills, a beam sweeping it, reads leaving through the top pins and writes arriving through the bottom" width="200">
+    </td>
+    <td valign="top">
+      <p>Every block on the die is a share of the filesystem the chip follows, lit from the bottom as it fills. The block at the waterline is lit in proportion, so a slow fill still moves. A beam sweeps the map at a pace that quickens with traffic, the orbit rings spin faster with it, reads run out of the top pins and writes run in through the bottom ones, each at its own throughput.</p>
+      <p>Colour is free space: green with room to grow, yellow at half, dark red when the disk is nearly full. The aura brightens with traffic. When the recorder is offline the die goes to the theme's muted colour and stops moving, so a dead service never looks like a quiet drive.</p>
+      <p>Everything is painted on a single 10 Hz tick and nothing is painted while the die is off screen.</p>
+    </td>
+  </tr>
+</table>
+
+## On the bar
+
+<p align="center">
+  <img src="docs/readouts.png" alt="The four Pulse chips on the bar with Disk Pulse in each of its six readouts: % free, % used, amount free, amount used, read and write throughput, drive temperature" width="820">
+</p>
+
+Six readouts, chosen by right-click and saved to your bar layout. Each mode reserves the width of the widest string it can produce, so a reading that gains a digit never re-lays out the bar section it sits in. The throughput mode holds every rate to five characters: `R 50.4M` over `W 2.4M`.
+
 ## The dashboard
 
 <table>
@@ -62,6 +85,33 @@ Disk Pulse is the sibling of [RAM Pulse](https://github.com/nixfred/ram.plugin.o
   </tr>
 </table>
 
+### Close-ups
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/closeup-hero.png" alt="Hero card: the die beside the free space on the followed filesystem, its size, filesystem type, LUKS and transport"></td>
+    <td width="50%" valign="top"><img src="docs/closeup-history.png" alt="Continuous history: read and write throughput on the left axis, capacity used and drive busy time on the right, with the read peak envelope"></td>
+  </tr>
+  <tr>
+    <td valign="top"><b>Free space, as the drive sees it.</b> The number is what you can still write. The caption says which filesystem, how big, on what, and through what.</td>
+    <td valign="top"><b>Four traces, two axes.</b> Read and write throughput share the left axis; capacity used and busy time share the right. Hover any point for the exact reading. Reboots and recording gaps break every trace.</td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/closeup-drive.png" alt="Drive card: temperature, SMART health, wear, power-on time, lifetime writes, spare blocks, unsafe shutdowns, media errors, in-flight requests, latency, IOPS and queue depth"></td>
+    <td width="50%" valign="top"><img src="docs/closeup-pool.png" alt="Btrfs pool card: data and metadata chunks, unallocated space, global reserve, device errors, last commit, discard saved, compression, dirty pages, writeback, full I/O pressure and last trim"></td>
+  </tr>
+  <tr>
+    <td valign="top"><b>Drive health without root.</b> SMART through udisks, temperature from the kernel's own sensor, request latency and queue depth from the block layer.</td>
+    <td valign="top"><b>The pool behind the mount.</b> What btrfs has allocated and to what, whether the device has ever thrown an error, how long commits take, what trim has reclaimed, and the kernel's pending writes.</td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top"><img src="docs/closeup-filesystems.png" alt="Filesystems card: one row per mounted filesystem with its own headroom bar, badges for LUKS, compression and remote mounts, and the drive line"></td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top"><b>Every filesystem, one row.</b> A btrfs pool mounted five times is one row that names the others. Click a row and the chip follows it.</td>
+  </tr>
+</table>
+
 ## What it does
 
 - Animated die whose block map fills with the filesystem and whose beam, rings and pin traffic follow real read and write throughput.
@@ -88,6 +138,10 @@ python3 install.py
 
 Installs under `~/.config/omarchy/plugins/nixfred.disk-pulse`, appends to the far-right bar, and enables `disk-pulse.service` for the graphical session. Existing files and bar layout are backed up under `~/.local/state/omarchy/backups/disk-pulse-TIMESTAMP/`.
 
+<p align="center">
+  <img src="docs/architecture.svg" alt="How it works: kernel and udisks sources feed the recorder, which writes a private snapshot and SQLite history that the bar widget reads" width="100%">
+</p>
+
 The recorder runs independently of the shell/popup: throughput, filesystems and pressure every 3 seconds, processes every 9 seconds, history every 15 seconds, SMART and the trim timer every 60 seconds. SQLite retains seven days (up to 40,320 samples), downsampled to ~240 points per displayed range; per-bucket peaks are retained. State is private (`0700` directory / `0600` files) in `$XDG_STATE_HOME/disk-pulse` or `~/.local/state/disk-pulse`, enforced on an existing directory and its files, not only on ones the recorder creates. History stores aggregate metrics only. The latest snapshot contains process names, PIDs and window titles and is replaced, not logged. Closed panels stop their large animations.
 
 ## Controls and diagnosis
@@ -113,7 +167,11 @@ Disable with `omarchy plugin disable nixfred.disk-pulse` and `systemctl --user d
 
 ## Theming
 
-Every colour resolves from the active Omarchy theme, and a theme switch is picked up live. Chrome comes from the shell's own popup roles: `popups.background`, `popups.text`, `accent`, `muted` and `urgent`. Card fills, hover states and separators are the theme foreground laid over the theme background at low alpha, so they follow a light theme as readily as a dark one rather than assuming either. Text uses the bar's font family.
+<p align="center">
+  <img src="docs/themes.png" alt="The same bar and hero card under three Omarchy themes: 2 Haxorz, Tokyo Night and the light Catppuccin Latte, the die taking each theme's own ramp colours" width="700">
+</p>
+
+Every colour resolves from the active Omarchy theme, and a theme switch is picked up live: the three captures above are the same session, switched with `omarchy-theme-set`, no restart. Chrome comes from the shell's own popup roles: `popups.background`, `popups.text`, `accent`, `muted` and `urgent`. Card fills, hover states and separators are the theme foreground laid over the theme background at low alpha, so they follow a light theme as readily as a dark one rather than assuming either. Text uses the bar's font family.
 
 The headroom ramp is the exception that proves the rule. It is the one colour on screen carrying meaning rather than style, so it stays a traffic light — but in the theme's own red, yellow and green, read from the theme's `colors.toml` by name or from the `color1` / `color2` / `color3` terminal slots. Each stop keeps the hue the theme chose and is lifted only as far as it must be to stay readable; only a stop at genuinely zero chroma borrows the shipped hue; and three stops that are really one colour fall back as a whole set. This is the same ramp treatment RAM Pulse, CPU Pulse and Net Pulse use, which is what makes the four read as siblings sitting beside each other on the bar. `tests/test_theming.cjs` fails the build if a hardcoded colour reappears in `Panel.qml`, and asserts that every theme installed on the machine still yields a ramp that can warn.
 
