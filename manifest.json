@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "nixfred.disk-pulse",
+  "name": "Disk Pulse",
+  "version": "1.0.0",
+  "author": "Fred Nix",
+  "license": "MIT",
+  "description": "A living storage die: free space, read and write throughput, drive busy time, I/O pressure, drive temperature and SMART health, btrfs allocation, seven-day history, and focus-only disk hogs.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "Disk Pulse",
+    "description": "Animated free space, read/write throughput, drive temperature and persistent seven-day history. Right-click to choose a readout.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "repository": "https://github.com/nixfred/disk.pulse",
+  "homepage": "https://nixfred.com"
+}
