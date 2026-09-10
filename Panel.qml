@@ -42,9 +42,13 @@ Panel {
         var reg = bar && bar.shell ? bar.shell.pluginRegistry : null
         return reg && reg.installedPlugins ? (reg.installedPlugins[root.moduleName] || null) : null
     }
-    readonly property string pluginVersion: pluginManifest && pluginManifest.version ? String(pluginManifest.version) : ''
-    readonly property string repoUrl: pluginManifest && pluginManifest.repository ? String(pluginManifest.repository) : 'https://github.com/nixfred/disk.pulse'
-    readonly property string homeUrl: pluginManifest && pluginManifest.homepage ? String(pluginManifest.homepage) : 'https://nixfred.com'
+    // Some shell builds hand back an empty registry entry for a plugin that
+    // is plainly running, so the manifest beside this file is the second
+    // source: still the manifest, never a version written into the QML.
+    property var fileManifest: ({})
+    readonly property string pluginVersion: pluginManifest && pluginManifest.version ? String(pluginManifest.version) : fileManifest.version ? String(fileManifest.version) : ''
+    readonly property string repoUrl: pluginManifest && pluginManifest.repository ? String(pluginManifest.repository) : fileManifest.repository ? String(fileManifest.repository) : 'https://github.com/nixfred/disk.pulse'
+    readonly property string homeUrl: pluginManifest && pluginManifest.homepage ? String(pluginManifest.homepage) : fileManifest.homepage ? String(fileManifest.homepage) : 'https://nixfred.com'
     property var disk: ({})
     property var histories: ({})
     property int tab: 0
@@ -104,9 +108,12 @@ Panel {
         root.close()
         Quickshell.execDetached(['xdg-open',url])
     }
-    function when(value) {
-        if(value===null||value===undefined||value==='') return '—'
-        return typeof value==='number'?Qt.formatDateTime(new Date(value*1000),'ddd d MMM h:mm AP'):String(value)
+    // A pool mounted many times names its first two other mounts and counts
+    // the rest, so the row stays one line at any number of subvolumes.
+    function alsoList(also) {
+        var list=also||[]
+        if(list.length<=2) return list.join(', ')
+        return list.slice(0,2).join(', ')+' +'+(list.length-2)+' more'
     }
     function fsBadges(fs) {
         var out=[]
@@ -132,26 +139,36 @@ Panel {
             {l:'UNSAFE SHUTDOWNS',v:Model.has(s.unsafeShutdowns)?String(s.unsafeShutdowns):'—',h:'power lost before flush'},
             {l:'MEDIA ERRORS',v:Model.has(s.mediaErrors)?String(s.mediaErrors):'—',h:Model.has(s.errorLogEntries)?String(s.errorLogEntries)+' error-log entries':'unrecovered data errors'},
             {l:'IN FLIGHT',v:(d.inflight?d.inflight[0]:0)+' r · '+(d.inflight?d.inflight[1]:0)+' w',h:d.scheduler+' scheduler · depth '+d.nrRequests},
-            {l:'LATENCY',v:Model.ms(r.awaitRead)+' · '+Model.ms(r.awaitWrite),h:'read · write, per request'},
-            {l:'REQUESTS',v:Model.perSec(r.readIops)+' · '+Model.perSec(r.writeIops),h:'read · write IOPS'},
+            {l:'LATENCY',v:Model.ms(r.awaitRead).replace(' ms','')+' · '+Model.ms(r.awaitWrite),h:'read · write, per request'},
+            {l:'REQUESTS',v:Model.count(r.readIops)+' · '+Model.perSec(r.writeIops),h:'read · write IOPS'},
             {l:'QUEUE DEPTH',v:(Model.num(r.queue)).toFixed(2),h:'average requests waiting'}
         ]
     }
     function poolStats(p) {
-        var sp=p.spaces||{}, data=sp.data||{}, meta=sp.metadata||{}, sys=sp.system||{}, e=p.errors||{}, c=p.commits||{}
+        var sp=p.spaces||{}, data=sp.data||{}, meta=sp.metadata||{}, e=p.errors||{}, c=p.commits||{}
         return [
-            {l:'DATA',v:Model.size(data.used)+' / '+Model.size(data.total),h:'chunks allocated · '+(data.profile||'single')},
-            {l:'METADATA',v:Model.size(meta.used)+' / '+Model.size(meta.total),h:(meta.profile==='dup'?'DUP: every byte stored twice':'chunks allocated · '+(meta.profile||'single'))},
-            {l:'SYSTEM',v:Model.size(sys.used)+' / '+Model.size(sys.total),h:'chunk tree · '+(sys.profile||'single')},
+            {l:'DATA',v:Model.size(data.used),h:'of '+Model.size(data.total)+' allocated · '+(data.profile||'single')},
+            {l:'METADATA',v:Model.size(meta.used),h:'of '+Model.size(meta.total)+(meta.profile==='dup'?' · DUP, ×2 on disk':' · '+(meta.profile||'single'))},
             {l:'UNALLOCATED',v:Model.size(p.unallocated),h:'raw space no chunk has claimed'},
-            {l:'GLOBAL RESERVE',v:Model.size(p.globalReserve?p.globalReserve.size:0),h:'kept back so metadata can always commit'},
-            {l:'DEVICE ERRORS',v:String(p.errorTotal||0),h:'read '+(e.read_errs||0)+' · write '+(e.write_errs||0)+' · flush '+(e.flush_errs||0)+' · corrupt '+(e.corruption_errs||0)},
+            {l:'GLOBAL RESERVE',v:Model.size(p.globalReserve?p.globalReserve.size:0),h:'so metadata can always commit'},
+            {l:'DEVICE ERRORS',v:String(p.errorTotal||0),h:'r '+(e.read_errs||0)+' · w '+(e.write_errs||0)+' · flush '+(e.flush_errs||0)+' · corrupt '+(e.corruption_errs||0)},
             {l:'LAST COMMIT',v:Model.ms(c.last_commit_ms),h:'slowest '+Model.ms(c.max_commit_ms)+' · '+Model.count(c.commits)+' commits'},
             {l:'DISCARD SAVED',v:Model.size(p.discardSaved),h:'trimmed since mount'},
-            {l:'COMPRESSION',v:root.primary&&root.primary.compress?root.primary.compress:'off',h:(p.features||[]).indexOf('compress_zstd')>=0?'zstd in use on this pool':'mount option'},
+            {l:'COMPRESSION',v:root.primary&&root.primary.compress?root.primary.compress:'off',h:(p.features||[]).indexOf('compress_zstd')>=0?'zstd in use on this pool':'mount option'}
+        ]
+    }
+    // Dirty and writeback pages are the kernel's side of storage; the trim
+    // timer is the drive's housekeeping. Both belong beside the pool.
+    function kernelStats() {
+        var t=root.disk.trim||{}
+        var trim=!t.timer?{v:'—',h:'fstrim.timer not found'}
+            :typeof t.last==='number'?{v:Model.ago(Math.max(0,root.now-t.last))+' ago',h:(typeof t.next==='number'?'next in '+Model.ago(Math.max(0,t.next-root.now)):'timer '+t.timer)+(t.result?' · '+t.result:'')}
+            :{v:t.last?String(t.last):'never',h:'timer '+t.timer+(t.result?' · '+t.result:'')}
+        return [
             {l:'DIRTY PAGES',v:Model.size(root.disk.dirty),h:'changed data waiting for disk'},
             {l:'WRITEBACK',v:Model.size(root.disk.writeback),h:'data currently being written'},
-            {l:'ALL TASKS STALLED',v:Model.pct(root.disk.psi&&root.disk.psi.full?root.disk.psi.full.avg10:0),h:'full I/O pressure · last 10s'}
+            {l:'ALL TASKS STALLED',v:Model.pct(root.disk.psi&&root.disk.psi.full?root.disk.psi.full.avg10:0),h:'full I/O pressure · last 10s'},
+            {l:'LAST TRIM',v:trim.v,h:trim.h}
         ]
     }
     function status() {
@@ -167,6 +184,10 @@ Panel {
         id:historyFile; path:root.stateDir+'/history.json'; watchChanges:true; printErrors:false
         onFileChanged:reload()
         onLoaded:{try{root.histories=JSON.parse(text())}catch(e){}}
+    }
+    FileView {
+        id:manifestFile; path:String(Qt.resolvedUrl('manifest.json')).replace(/^file:\/\//,''); printErrors:false
+        onLoaded:{try{var m=JSON.parse(text());if(m&&typeof m==='object')root.fileManifest=m}catch(e){}}
     }
     FileView {
         // The theme's own palette, for the three ramp stops the shell does not
@@ -256,10 +277,11 @@ Panel {
         property string label:''
         property string value:''
         property string hint:''
+        property int valueSize:20
         radius:12;color:root.surface;border.color:root.stroke
         Column {anchors.fill:parent;anchors.margins:12;spacing:5
-            Label{text:label;font.pixelSize:10;font.letterSpacing:1}
-            Heading{text:value;font.pixelSize:20;width:parent.width;elide:Text.ElideRight}
+            Label{text:label;font.pixelSize:10;font.letterSpacing:1;width:parent.width;elide:Text.ElideRight}
+            Heading{text:value;font.pixelSize:valueSize;width:parent.width;elide:Text.ElideRight}
             Label{text:hint;font.pixelSize:10;width:parent.width;elide:Text.ElideRight}
         }
     }
@@ -375,7 +397,7 @@ Panel {
                                     readonly property color own:fsRow.modelData.freePct===null||fsRow.modelData.freePct===undefined?root.themeMuted:Model.ramp(fsRow.modelData.freePct,root.rampPalette)
                                     Row{width:parent.width;y:2
                                         Label{width:parent.width*0.55;elide:Text.ElideRight;font.pixelSize:11;color:fsRow.followed?root.themeText:root.themeSoft;font.bold:fsRow.followed
-                                            text:fsRow.modelData.mount+'  ·  '+fsRow.modelData.fstype+(root.fsBadges(fsRow.modelData)?'  ·  '+root.fsBadges(fsRow.modelData):'')+(fsRow.modelData.also&&fsRow.modelData.also.length?'  ·  also '+fsRow.modelData.also.join(', '):'')}
+                                            text:fsRow.modelData.mount+'  ·  '+fsRow.modelData.fstype+(root.fsBadges(fsRow.modelData)?'  ·  '+root.fsBadges(fsRow.modelData):'')+(fsRow.modelData.also&&fsRow.modelData.also.length?'  ·  also '+root.alsoList(fsRow.modelData.also):'')}
                                         Label{width:parent.width*0.45;horizontalAlignment:Text.AlignRight;font.pixelSize:11;color:root.themeSoft
                                             text:fsRow.modelData.responsive===false?'not answering':fsRow.modelData.total?Model.size(fsRow.modelData.free)+' free  ·  '+Model.size(fsRow.modelData.used)+' of '+Model.size(fsRow.modelData.total):'—'}
                                     }
@@ -385,7 +407,7 @@ Panel {
                                     MouseArea{anchors.fill:parent;cursorShape:Qt.PointingHandCursor;onClicked:root.setMountpoint(fsRow.modelData.mount)}
                                 }
                             }
-                            Label{width:parent.width;elide:Text.ElideRight;font.pixelSize:10;text:root.drive?'Drive: '+(root.drive.model||root.drive.name)+'  ·  '+root.drive.transport+' '+(root.drive.rotational?'HDD':'SSD')+'  ·  '+Model.dec(root.drive.size)+'  ·  '+Model.temp(root.drive.temp)+'  ·  '+root.drive.scheduler+' scheduler':'No physical drive is visible; the filesystems above are all there is.'}
+                            Label{width:parent.width;elide:Text.ElideRight;font.pixelSize:10;text:root.drive?'Drive: '+(root.drive.model||root.drive.name)+'  ·  '+root.drive.transport+' '+(root.drive.rotational?'HDD':'SSD')+'  ·  '+Model.dec(root.drive.size)+'  ·  '+Model.temp(root.drive.temp)+'  ·  scheduler '+root.drive.scheduler:'No physical drive is visible; the filesystems above are all there is.'}
                         }
                     }
                 }
@@ -429,50 +451,39 @@ Panel {
                 }
                 Column {
                     width:parent.width;spacing:12;visible:root.tab===2;height:visible?implicitHeight:0
-                    Repeater{model:root.disks
-                        Column{
-                            id:driveCard
-                            required property var modelData
-                            width:mainColumn.width;spacing:10
-                            Row{width:parent.width
-                                Heading{text:(driveCard.modelData.model||driveCard.modelData.name).toUpperCase();font.pixelSize:13;width:parent.width*0.6;elide:Text.ElideRight}
-                                Label{text:driveCard.modelData.name+'  ·  '+driveCard.modelData.transport+' '+(driveCard.modelData.rotational?'HDD':'SSD')+'  ·  '+Model.dec(driveCard.modelData.size)+(driveCard.modelData.firmware?'  ·  fw '+driveCard.modelData.firmware:'');width:parent.width*0.4;horizontalAlignment:Text.AlignRight;font.pixelSize:11;elide:Text.ElideLeft}
-                            }
-                            Grid{width:parent.width;columns:3;spacing:10
-                                Repeater{model:root.driveStats(driveCard.modelData)
-                                    Stat{required property var modelData;width:(mainColumn.width-20)/3;height:91;label:modelData.l;value:modelData.v;hint:modelData.h}
-                                }
-                            }
-                            Label{width:parent.width;elide:Text.ElideRight;font.pixelSize:10;text:(driveCard.modelData.partitions||[]).length+' partitions  ·  '+(driveCard.modelData.discard?'discard supported':'no discard')+'  ·  write cache '+(driveCard.modelData.writeCache||'unknown')+'  ·  '+driveCard.modelData.logicalBlock+'-byte blocks'+(driveCard.modelData.smart&&driveCard.modelData.smart.updated?'  ·  SMART read '+Qt.formatTime(new Date(driveCard.modelData.smart.updated*1000),'h:mm AP'):'')}
+                    // One drive card: the one behind the followed filesystem.
+                    // A second drive would push the tab past a 1080p screen,
+                    // and panels never scroll; follow one of its filesystems
+                    // on the Overview tab to see it here.
+                    Row{width:parent.width;visible:root.drive!==null
+                        Heading{text:root.drive?(root.drive.model||root.drive.name).toUpperCase():'';font.pixelSize:13;width:parent.width*0.5;elide:Text.ElideRight}
+                        Label{text:root.drive?root.drive.name+'  ·  '+root.drive.transport+' '+(root.drive.rotational?'HDD':'SSD')+'  ·  '+Model.dec(root.drive.size)+(root.drive.firmware?'  ·  fw '+root.drive.firmware:''):'';width:parent.width*0.5;horizontalAlignment:Text.AlignRight;font.pixelSize:11;elide:Text.ElideLeft}
+                    }
+                    Grid{width:parent.width;columns:4;spacing:10;visible:root.drive!==null
+                        Repeater{model:root.drive?root.driveStats(root.drive):[]
+                            Stat{required property var modelData;width:(mainColumn.width-30)/4;height:80;valueSize:17;label:modelData.l;value:modelData.v;hint:modelData.h}
                         }
                     }
-                    Label{visible:root.disks.length===0;width:parent.width;wrapMode:Text.WordWrap;text:'No physical drive is visible from this session: a container, a diskless boot, or a virtual disk the kernel does not expose as a device.';font.pixelSize:11}
+                    Label{visible:root.drive!==null;width:parent.width;elide:Text.ElideRight;font.pixelSize:10;text:root.drive?(root.drive.partitions||[]).length+' partitions  ·  '+(root.drive.discard?'discard supported':'no discard')+'  ·  write cache '+(root.drive.writeCache||'unknown')+'  ·  '+root.drive.logicalBlock+'-byte blocks'+(root.drive.smart&&root.drive.smart.updated?'  ·  SMART read '+Qt.formatTime(new Date(root.drive.smart.updated*1000),'h:mm AP'):'')+(root.disks.length>1?'  ·  also '+root.disks.filter(function(d){return d.name!==root.drive.name}).map(function(d){return d.name+' '+Model.dec(d.size)}).join(', ')+' — follow a filesystem on Overview to inspect':''):''}
+                    Label{visible:root.drive===null;width:parent.width;wrapMode:Text.WordWrap;text:'No physical drive is visible from this session: a container, a diskless boot, or a virtual disk the kernel does not expose as a device.';font.pixelSize:11}
                     Rectangle{width:parent.width;height:1;color:root.stroke}
-                    Heading{text:root.pool?'BTRFS POOL BEHIND '+(root.primary?root.primary.mount.toUpperCase():'/'):'KERNEL WRITEBACK';font.pixelSize:13}
-                    Grid{width:parent.width;columns:3;spacing:10
-                        Repeater{model:root.pool?root.poolStats(root.pool):[
-                            {l:'DIRTY PAGES',v:Model.size(root.disk.dirty),h:'changed data waiting for disk'},
-                            {l:'WRITEBACK',v:Model.size(root.disk.writeback),h:'data currently being written'},
-                            {l:'ALL TASKS STALLED',v:Model.pct(root.disk.psi&&root.disk.psi.full?root.disk.psi.full.avg10:0),h:'full I/O pressure · last 10s'}
-                        ]
-                            Stat{required property var modelData;width:(mainColumn.width-20)/3;height:91;label:modelData.l;value:modelData.v;hint:modelData.h}
+                    Heading{text:root.pool?'BTRFS POOL BEHIND '+(root.primary?root.primary.mount.toUpperCase():'/'):'KERNEL WRITEBACK AND TRIM';font.pixelSize:13}
+                    Grid{width:parent.width;columns:4;spacing:10;visible:root.pool!==null
+                        Repeater{model:root.pool?root.poolStats(root.pool):[]
+                            Stat{required property var modelData;width:(mainColumn.width-30)/4;height:80;valueSize:17;label:modelData.l;value:modelData.v;hint:modelData.h}
                         }
                     }
-                    Rectangle{width:parent.width;height:76;radius:12;color:root.surface;border.color:root.stroke
-                        Column{anchors.fill:parent;anchors.margins:14;spacing:7
-                            Row{width:parent.width
-                                Heading{text:'TRIM';font.pixelSize:12;width:parent.width/2}
-                                Label{text:root.disk.trim&&root.disk.trim.timer?'fstrim.timer '+root.disk.trim.timer+(root.disk.trim.result?'  ·  last result '+root.disk.trim.result:''):'fstrim.timer not found';width:parent.width/2;horizontalAlignment:Text.AlignRight;font.pixelSize:10}
-                            }
-                            Label{width:parent.width;elide:Text.ElideRight;font.pixelSize:11;color:root.themeSoft;text:root.disk.trim&&root.disk.trim.timer?'Last discard pass '+root.when(root.disk.trim.last)+'  ·  next '+root.when(root.disk.trim.next):'Periodic discard tells the drive which blocks are free so it can wear-level and stay fast. Enable it with systemctl enable --now fstrim.timer.'}
+                    Grid{width:parent.width;columns:4;spacing:10
+                        Repeater{model:root.kernelStats()
+                            Stat{required property var modelData;width:(mainColumn.width-30)/4;height:80;valueSize:17;label:modelData.l;value:modelData.v;hint:modelData.h}
                         }
                     }
-                    Rectangle{width:parent.width;height:152;radius:12;color:Qt.tint(root.themeBg,Qt.alpha(root.rampGood,0.08));border.color:Qt.alpha(root.rampGood,0.42)
-                        Column{anchors.fill:parent;anchors.margins:14;spacing:9
+                    Rectangle{width:parent.width;height:84;radius:12;color:Qt.tint(root.themeBg,Qt.alpha(root.rampGood,0.08));border.color:Qt.alpha(root.rampGood,0.42)
+                        Column{anchors.left:parent.left;anchors.top:parent.top;anchors.margins:14;width:parent.width-220;spacing:6
                             Heading{text:'SETTLE PENDING WRITES';font.pixelSize:12}
-                            Label{width:parent.width;wrapMode:Text.WordWrap;text:'Dirty pages are changes the kernel is still holding in RAM. Flushing writes them out now, the same sync a clean shutdown performs: safe, unprivileged, and briefly busy on the drive. Nothing is discarded and no cache is dropped.';font.pixelSize:11;color:root.themeSoft}
-                            Action{text:actionProc.running?'Working…':'Flush pending writes';accent:root.rampGood;onClicked:root.runAction('flush')}
+                            Label{width:parent.width;wrapMode:Text.WordWrap;text:'The same unprivileged sync a clean shutdown performs: dirty pages go to disk now, nothing is discarded and no cache is dropped. Briefly busy on the drive; once a minute at most.';font.pixelSize:10;color:root.themeSoft}
                         }
+                        Action{anchors.right:parent.right;anchors.rightMargin:14;anchors.verticalCenter:parent.verticalCenter;text:actionProc.running?'Working…':'Flush pending writes';accent:root.rampGood;onClicked:root.runAction('flush')}
                     }
                     Label{width:parent.width;wrapMode:Text.WordWrap;text:'Everything here is read from sysfs, procfs and udisks without privilege. No trim, scrub, balance, format, mount, self-test or scheduler change is exposed.';font.pixelSize:10}
                 }

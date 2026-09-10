@@ -49,7 +49,7 @@ Disk Pulse is the sibling of [RAM Pulse](https://github.com/nixfred/ram.plugin.o
     </td>
   </tr>
   <tr>
-    <td valign="top"><b>Storage lab.</b> A card per drive: temperature against its warning threshold, SMART health, wear, power-on time, lifetime bytes written and read, spare blocks, unsafe shutdowns, media errors, requests in flight, per-request latency, IOPS and queue depth. Then the btrfs pool behind the followed filesystem — data, metadata and system chunks, unallocated space, the global reserve, device error counters, commit timing, discard savings, compression — the fstrim timer, and a flush for pending writes.</td>
+    <td valign="top"><b>Storage lab.</b> The drive behind the followed filesystem: temperature against its warning threshold, SMART health, wear, power-on time, lifetime bytes written and read, spare blocks, unsafe shutdowns, media errors, requests in flight, per-request latency, IOPS and queue depth. Then the btrfs pool behind that filesystem — data and metadata chunks, unallocated space, the global reserve, device error counters, commit timing, discard savings, compression — dirty and writeback pages, full I/O pressure, the fstrim timer's last and next run, and a flush for pending writes.</td>
     <td valign="top"><b>Readout picker.</b> Right-click the chip to choose what lives beside it. Keys 1–6 pick a mode; the choice is saved to your bar layout.</td>
   </tr>
   <tr>
